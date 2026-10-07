@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+_local/
+.pytest_cache/
+# Runtime evidence and private configuration belong outside the repository.
+*.bin
+*.iso
+*.qcow2
+*.xbe
+*.sav
+*.png
+*.ppm
+*.log
+*.local.json
