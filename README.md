@@ -65,8 +65,12 @@ Create a private JSON server config, for example `C:/private/xemu/server.json`:
 ```
 
 Optional `symbols_file` points to a private JSON object mapping names to addresses.
-No symbols or console/game files are distributed here. Unknown config keys are
-errors; `allow_write` must be a JSON boolean. These are the complete config keys.
+Optional `audiodev` is a single `-audiodev` option value, for example
+`"sdl,id=capture0"`, appended to the emulator command line so that audio capture
+has a named backend to attach to; `"none,id=capture0"` captures without playing
+sound on the host. No symbols or console/game files are distributed here. Unknown
+config keys are errors; `allow_write` must be a JSON boolean. These are the
+complete config keys.
 
 Add this to your MCP client's configuration after replacing the example paths:
 
@@ -102,6 +106,9 @@ any client configuration. Stdout is only MCP; diagnostics go to stderr.
 | `xemu_save_state`, `xemu_load_state`, `xemu_delete_state` | `tag`; qcow2 snapshots using HMP savevm/loadvm/delvm |
 | `xemu_screenshot` | Absolute PNG `filename`; optional `include_base64`, `bring_to_front` |
 | `xemu_symbols` | Optional case-insensitive name substring `query` in private symbols file |
+| `xemu_audio_devices` | List running QEMU audiodevs and their ids |
+| `xemu_audio_capture_start` | Absolute `.wav` `filename`; optional `audiodev`, `frequency` (4000–192000), `bits` (8/16), `channels` (1/2) |
+| `xemu_audio_capture_stop` | `capture_index` (0–9); stop capture and finalize the WAV header |
 
 Addresses accept decimal or `0x` hexadecimal and must fit 32-bit memory. Decodes
 are little-endian `u8`, `u16`, `u32`, `f32`, or bounded UTF-8 `cstring`. Numeric
@@ -168,6 +175,27 @@ the destination, so failed captures cannot return a stale existing image.
 Windows may refuse raising a window from a hidden stdio host. If that happens,
 make the owned window visible before calling the fallback. The QMP screenshot
 command avoids this desktop dependency.
+
+## Audio capture
+
+`xemu_audio_capture_start` / `xemu_audio_capture_stop` drive QEMU's HMP
+`wavcapture` / `stopcapture` through QMP `human-monitor-command`, writing a WAV
+file on the host while the guest runs. Capture taps the emulated audio mixer:
+it records what the game actually outputs, including looped sounds, without
+depending on host speakers, desktop focus or WASAPI loopback.
+
+`wavcapture` requires a named audiodev. Query `xemu_audio_devices` first; when
+exactly one audiodev runs, its id is selected automatically. Emulators started
+on the legacy default audio path may expose none — in that case set `"audiodev"`
+in the private server config (for example `"sdl,id=capture0"`, or
+`"none,id=capture0"` for silent capture) and restart the emulator. Both commands
+are deprecated upstream since v10.2 but present in the tested builds; monitor
+deprecation warnings are tolerated, other non-empty monitor output is an error.
+The WAV header is finalized only when capture stops: stop before reading the
+file, and before stopping the emulator. Capture paths must be absolute, end in
+`.wav`, contain no whitespace (HMP command line) and have an existing parent
+directory. Keep captures outside this repository; recorded game audio is game
+content.
 
 ## Real-emulator smoke test
 

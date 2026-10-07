@@ -33,6 +33,7 @@ class Config:
     symbols_file: str | None = None
     startup_timeout: float = 60
     allowed_game_roots: list[str] = field(default_factory=list)
+    audiodev: str | None = None
 
     def __post_init__(self):
         for port in (self.qmp_port, self.gdb_port):
@@ -47,6 +48,10 @@ class Config:
         for value in (self.executable, self.runtime_dir):
             if not isinstance(value, str) or not value:
                 raise ValueError('Executable and runtime directory must be nonempty strings')
+        if (self.audiodev is not None
+                and (not isinstance(self.audiodev, str)
+                     or not re.fullmatch(r'[A-Za-z0-9_,=.:-]{1,128}', self.audiodev))):
+            raise ValueError('audiodev must be a single -audiodev option value such as "sdl,id=capture0"')
         if (not isinstance(self.allowed_game_roots, list)
                 or any(not isinstance(root, str) or not Path(root).is_absolute()
                        for root in self.allowed_game_roots)):
@@ -170,6 +175,10 @@ class Emulator:
             args = [str(self.executable), '-config_path', str(path), '-qmp',
                     f'tcp:127.0.0.1:{self.config.qmp_port},server=on,wait=off',
                     '-gdb', f'tcp:127.0.0.1:{self.config.gdb_port}']
+            if self.config.audiodev:
+                # wavcapture/stopcapture need a named audiodev; an emulator
+                # started on the legacy default audio path may expose none.
+                args.extend(['-audiodev', self.config.audiodev])
             if disc_path:
                 disc = Path(disc_path).expanduser().resolve(strict=True)
                 args.extend(['-dvd_path', str(disc)])
@@ -359,6 +368,69 @@ class Emulator:
             if output.strip():
                 raise RuntimeError(f'Snapshot {action} failed: {output.strip()}')
         return {'tag': tag, 'action': action, 'ok': True}
+
+    async def audio_devices(self):
+        async with self.lock:
+            self._require_owned()
+            return {'audiodevs': await self.qmp.execute('query-audiodevs')}
+
+    async def _resolve_audiodev(self, requested):
+        devices = await self.qmp.execute('query-audiodevs')
+        ids = [device['id'] for device in devices if device.get('id')]
+        if requested is not None:
+            if requested not in ids:
+                raise ValueError(f"audiodev '{requested}' is not running; available: {ids or 'none'}")
+            return requested
+        if len(ids) == 1:
+            return ids[0]
+        if not ids:
+            raise RuntimeError('The emulator exposes no named audiodev; set "audiodev" in the private '
+                               'server config (for example "sdl,id=capture0") and restart')
+        raise ValueError(f'Several audiodevs are running {ids}; pass audiodev explicitly')
+
+    async def audio_capture_start(self, filename, audiodev=None, frequency=44100, bits=16, channels=2):
+        path = Path(filename).expanduser()
+        if not path.is_absolute() or path.suffix.lower() != '.wav':
+            raise ValueError('Capture filename must be an absolute .wav path')
+        path = path.resolve()
+        if not path.parent.is_dir():
+            raise ValueError('Capture parent directory must already exist')
+        if any(char.isspace() for char in str(path)):
+            raise ValueError('Capture path must not contain whitespace (HMP command line)')
+        if type(frequency) is not int or not 4000 <= frequency <= 192000:
+            raise ValueError('frequency must be an integer from 4000 to 192000 Hz')
+        if bits not in (8, 16):
+            raise ValueError('bits must be 8 or 16')
+        if channels not in (1, 2):
+            raise ValueError('channels must be 1 or 2')
+        if audiodev is not None and not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', audiodev):
+            raise ValueError('audiodev must be 1 to 64 ASCII letters, digits, dot, underscore or hyphen')
+        async with self.lock:
+            self._require_owned()
+            device = await self._resolve_audiodev(audiodev)
+            output = await self.qmp.hmp(f'wavcapture {path} {device} {frequency} {bits} {channels}')
+            self._check_capture_output('start', output)
+        return {'filename': str(path), 'audiodev': device, 'frequency': frequency,
+                'bits': bits, 'channels': channels, 'capturing': True}
+
+    async def audio_capture_stop(self, capture_index=0):
+        if type(capture_index) is not int or not 0 <= capture_index <= 9:
+            raise ValueError('capture_index must be an integer from 0 to 9')
+        async with self.lock:
+            self._require_owned()
+            output = await self.qmp.hmp(f'stopcapture {capture_index}')
+            self._check_capture_output('stop', output)
+        return {'capture_index': capture_index, 'capturing': False}
+
+    @staticmethod
+    def _check_capture_output(action, output):
+        # Successful wavcapture/stopcapture return empty text; HMP errors arrive
+        # as a QMP success string. Deprecation notices go to the monitor as
+        # warnings on some builds and are not failures.
+        problems = [line.strip() for line in output.splitlines()
+                    if line.strip() and 'deprecat' not in line.lower()]
+        if problems:
+            raise RuntimeError(f'Audio capture {action} failed: {problems[0]}')
 
     async def press(self, buttons, hold_ms=100):
         if type(hold_ms) is not int or not 1 <= hold_ms <= 10000:

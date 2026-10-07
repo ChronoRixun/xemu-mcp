@@ -23,6 +23,8 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                     'xemu_press', 'xemu_read', 'xemu_read_physical', 'xemu_write',
                     'xemu_registers', 'xemu_save_state', 'xemu_load_state',
                     'xemu_delete_state', 'xemu_screenshot', 'xemu_symbols',
+                    'xemu_audio_devices', 'xemu_audio_capture_start',
+                    'xemu_audio_capture_stop',
                 })
                 result = await session.call_tool('xemu_symbols', {'query': 'invented'})
                 self.assertFalse(result.isError)

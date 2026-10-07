@@ -130,6 +130,31 @@ def create_server(config=None):
         return await emulator.screenshot(filename, include_base64, bring_to_front)
 
     @server.tool()
+    async def xemu_audio_devices() -> dict[str, Any]:
+        """List running QEMU audiodevs (ids needed by xemu_audio_capture_start)."""
+        return await emulator.audio_devices()
+
+    @server.tool()
+    async def xemu_audio_capture_start(filename: str, audiodev: str | None = None,
+                                       frequency: int = 44100, bits: int = 16,
+                                       channels: int = 2) -> dict[str, Any]:
+        """Start capturing emulated audio to a .wav via HMP wavcapture over QMP.
+
+        filename: absolute .wav path without whitespace; its directory must exist.
+        audiodev: QEMU audiodev id; optional when exactly one is running (list
+        with xemu_audio_devices). If none is running, set "audiodev" in the
+        private server config (e.g. "sdl,id=capture0") and restart. Capture taps
+        the audio mixer, so record only while the guest scene of interest runs;
+        stop with xemu_audio_capture_stop before reading the file.
+        """
+        return await emulator.audio_capture_start(filename, audiodev, frequency, bits, channels)
+
+    @server.tool()
+    async def xemu_audio_capture_stop(capture_index: int = 0) -> dict[str, Any]:
+        """Stop capture 0..9 via HMP stopcapture; finalizes the .wav header."""
+        return await emulator.audio_capture_stop(capture_index)
+
+    @server.tool()
     async def xemu_symbols(query: str = '') -> dict[str, Any]:
         """Filter symbols from an optional private JSON file outside the repository."""
         return emulator.symbols(query)

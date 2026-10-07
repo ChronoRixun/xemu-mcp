@@ -22,6 +22,11 @@ guest because tested builds stall on resume after an externally paused save.
 They write into a private
 qcow2 HDD; no guest data or runtime evidence belongs in this repository.
 
+Audio capture uses only HMP wavcapture/stopcapture with validated paths and
+parameters, attached to a named audiodev reported by the emulator itself.
+Monitor errors are surfaced even when QMP reports success; recorded audio is
+game content and stays outside this repository.
+
 ## V-TBD (number assigned at merge)
 
 `tools/check_no_game_content.py --all` restricts the Git index to the explicit

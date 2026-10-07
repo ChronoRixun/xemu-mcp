@@ -148,9 +148,64 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unowned_actions_fail(self):
         emulator = Emulator(Config())
-        for call in (emulator.status(), emulator.stop(), emulator.read('0x100', 4), emulator.press(['a'])):
+        for call in (emulator.status(), emulator.stop(), emulator.read('0x100', 4), emulator.press(['a']),
+                     emulator.audio_devices(), emulator.audio_capture_stop()):
             with self.assertRaisesRegex(RuntimeError, 'owned'):
                 await call
+
+    async def test_audio_capture_validates_path_and_format_before_contacting_emulator(self):
+        emulator = self.setup_emulator()
+        with tempfile.TemporaryDirectory() as tmp:
+            for filename in ['relative.wav', str(Path(tmp) / 'not-a-wave.txt'),
+                             str(Path(tmp) / 'with space.wav'), str(Path(tmp) / 'missing' / 'x.wav')]:
+                with self.assertRaises(ValueError):
+                    await emulator.audio_capture_start(filename)
+            target = str(Path(tmp) / 'ok.wav')
+            for options in ({'frequency': 100}, {'frequency': '44100'}, {'bits': 24},
+                            {'channels': 6}, {'audiodev': 'bad id'}):
+                with self.assertRaises(ValueError):
+                    await emulator.audio_capture_start(target, **options)
+        emulator.qmp.execute.assert_not_awaited()
+        emulator.qmp.hmp.assert_not_awaited()
+
+    async def test_audio_capture_resolves_audiodev_and_tolerates_deprecation_notice(self):
+        emulator = self.setup_emulator()
+        emulator.qmp.execute.return_value = []
+        emulator.qmp.hmp.return_value = ''
+        with tempfile.TemporaryDirectory() as tmp:
+            target = str(Path(tmp) / 'ok.wav')
+            with self.assertRaisesRegex(RuntimeError, 'audiodev'):
+                await emulator.audio_capture_start(target)
+            emulator.qmp.execute.return_value = [{'id': 'one'}, {'id': 'two'}]
+            with self.assertRaisesRegex(ValueError, 'explicitly'):
+                await emulator.audio_capture_start(target)
+            result = await emulator.audio_capture_start(target, audiodev='two')
+            self.assertEqual(result['audiodev'], 'two')
+            self.assertEqual(emulator.qmp.hmp.await_args_list[-1].args[0],
+                             f'wavcapture {Path(target).resolve()} two 44100 16 2')
+            emulator.qmp.hmp.return_value = "'wavcapture' is deprecated since v10.2, to be removed\n"
+            result = await emulator.audio_capture_start(target, audiodev='two')
+            self.assertTrue(result['capturing'])
+            emulator.qmp.hmp.return_value = "Error: can't capture"
+            with self.assertRaisesRegex(RuntimeError, "can't capture"):
+                await emulator.audio_capture_start(target, audiodev='two')
+
+    async def test_audio_capture_stop_validates_index(self):
+        emulator = self.setup_emulator()
+        for index in (-1, 10, '0'):
+            with self.assertRaises(ValueError):
+                await emulator.audio_capture_stop(index)
+        emulator.qmp.hmp.return_value = ''
+        result = await emulator.audio_capture_stop(1)
+        self.assertEqual(result, {'capture_index': 1, 'capturing': False})
+        self.assertEqual(emulator.qmp.hmp.await_args_list[-1].args[0], 'stopcapture 1')
+
+    def test_config_accepts_audiodev_and_rejects_option_injection(self):
+        self.assertIsNone(Config().audiodev)
+        self.assertEqual(Config(audiodev='sdl,id=capture0').audiodev, 'sdl,id=capture0')
+        for value in ('sdl,id=x -snapshot', 'a;quit', 5):
+            with self.assertRaises(ValueError):
+                Config(audiodev=value)
 
     async def test_screenshot_uses_fork_and_propagates_real_errors(self):
         emulator = self.setup_emulator()

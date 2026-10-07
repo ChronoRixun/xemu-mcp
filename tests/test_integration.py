@@ -3,7 +3,9 @@
 import asyncio
 import json
 import re
+import tempfile
 import unittest
+from pathlib import Path
 
 from xemu_mcp.protocols import QMP
 from xemu_mcp.service import Config, Emulator
@@ -15,6 +17,8 @@ class FakeEmulator:
         self.running = True
         self.snapshots = {}
         self.servers = []
+        self.captures = []
+        self.capturing = False
 
     async def start(self):
         for handler in (self.qmp_peer, self.gdb_peer):
@@ -36,6 +40,8 @@ class FakeEmulator:
                 result = {}
                 if command == 'query-status':
                     result = {'running': self.running, 'status': 'running' if self.running else 'paused'}
+                elif command == 'query-audiodevs':
+                    result = [{'id': 'capture0', 'driver': 'sdl'}]
                 elif command in ('stop', 'cont'):
                     self.running = command == 'cont'
                     writer.write(b'{"event":"RESUME"}\n')
@@ -58,6 +64,21 @@ class FakeEmulator:
                         result = f'{address:016x}: ' + ' '.join(f'0x{v:02x}' for v in self.memory[address:address+length])
                     elif text == 'info registers':
                         result = 'EAX=00000001 EIP=00001000 ESP=00000100 EFL=00000202\r\n'
+                    elif text.startswith('wavcapture '):
+                        parts = text.split()
+                        if len(parts) == 6 and parts[2] == 'capture0':
+                            self.captures.append(text)
+                            self.capturing = True
+                            result = ''
+                        else:
+                            result = f"audiodev '{parts[2] if len(parts) > 2 else '?'}' not found"
+                    elif text.startswith('stopcapture '):
+                        if self.capturing:
+                            self.captures.append(text)
+                            self.capturing = False
+                            result = ''
+                        else:
+                            result = 'Capture 0 is not active'
                 writer.write(json.dumps({'return': result, 'id': request['id']}).encode() + b'\n')
                 await writer.drain()
         finally:
@@ -138,6 +159,21 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.emulator.snapshot('delete', 'invented-slot')
         with self.assertRaisesRegex(RuntimeError, 'snapshot not found'):
             await self.emulator.snapshot('load', 'invented-slot')
+
+    async def test_audio_capture_uses_hmp_and_surfaces_monitor_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'invented-scene.wav'
+            started = await self.emulator.audio_capture_start(str(target), frequency=22050, channels=1)
+            self.assertEqual(started['audiodev'], 'capture0')
+            self.assertTrue(started['capturing'])
+            self.assertEqual(self.peer.captures, [f'wavcapture {target} capture0 22050 16 1'])
+            stopped = await self.emulator.audio_capture_stop()
+            self.assertFalse(stopped['capturing'])
+            self.assertEqual(self.peer.captures[-1], 'stopcapture 0')
+            with self.assertRaisesRegex(RuntimeError, 'not active'):
+                await self.emulator.audio_capture_stop()
+            with self.assertRaisesRegex(ValueError, 'not running'):
+                await self.emulator.audio_capture_start(str(target), audiodev='missing0')
 
 
 if __name__ == '__main__':
