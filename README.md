@@ -68,7 +68,9 @@ Optional `symbols_file` points to a private JSON object mapping names to address
 Optional `audiodev` is a single `-audiodev` option value, for example
 `"sdl,id=capture0"`, appended to the emulator command line so that audio capture
 has a named backend to attach to; `"none,id=capture0"` captures without playing
-sound on the host. No symbols or console/game files are distributed here. Unknown
+sound on the host. Optional `snapshot_catalog` is an absolute `.json` path outside
+this repository (its directory must exist) where snapshot tags, descriptions,
+zones and notes are recorded; see *Snapshot catalogue*. No symbols or console/game files are distributed here. Unknown
 config keys are errors; `allow_write` must be a JSON boolean. These are the
 complete config keys.
 
@@ -103,7 +105,20 @@ any client configuration. Stdout is only MCP; diagnostics go to stderr.
 | `xemu_read_physical` | Same arguments; physical memory through HMP `xp` |
 | `xemu_write` | `address`, `hex_data`; disabled by default; virtual write with read-back verification |
 | `xemu_registers` | Parsed register hex values plus full HMP text |
-| `xemu_save_state`, `xemu_load_state`, `xemu_delete_state` | `tag`; qcow2 snapshots using HMP savevm/loadvm/delvm |
+| `xemu_save_state` | `tag`, optional `description`, `zone`, `notes`; qcow2 snapshot using HMP savevm, recorded in the catalogue |
+| `xemu_load_state`, `xemu_delete_state` | `tag`; HMP loadvm/delvm; catalogue `last_loaded` / entry removal |
+| `xemu_state_list` | Optional `query` substring, `zone`, `check_emulator`; search the private snapshot catalogue |
+| `xemu_state_annotate` | `tag`, optional `description`, `zone`, `notes`; edit a catalogue entry only |
+| `xemu_input_sequence` | `steps` list of `{buttons or button, hold_ms, wait_ms}`, optional `dry_run`; scripted controller input |
+| `xemu_mem_search` | `address`, `length` (1–64 MiB), `value_type`, `value`, optional `tolerance`, `alignment`, `max_results` (1–1000) |
+| `xemu_mem_capture` | `address`, `length` (1–16 MiB), optional `value_type` (default `u32`), `alignment`; returns a handle |
+| `xemu_mem_diff` | `handle`, optional `max_results`, `rebase`; changed typed positions with old/new values |
+| `xemu_mem_narrow` | `handle`, `condition`, optional `value`, `tolerance`, `max_results`; cheat-finder candidate filter |
+| `xemu_mem_captures`, `xemu_mem_release` | List handles / release `handle` |
+| `xemu_read_struct` | `address`, `fields` (`name:type@offset` list), optional `structs`, `max_depth` (0–4) |
+| `xemu_break_set` | `address`, optional `kind` (`exec`/`write`/`read`/`access`), `length` (1/2/4/8); register a point |
+| `xemu_break_clear`, `xemu_break_list` | Optional `point_id` (all when omitted) / list points with hit counts |
+| `xemu_break_wait` | Optional `timeout_s` (0.05–120), `leave` (`paused`/`running`), `stack_bytes` (0–1024), `window_bytes` (0–4096) |
 | `xemu_screenshot` | Absolute PNG `filename`; optional `include_base64`, `bring_to_front` |
 | `xemu_symbols` | Optional case-insensitive name substring `query` in private symbols file |
 | `xemu_audio_devices` | List running QEMU audiodevs and their ids |
@@ -197,6 +212,86 @@ file, and before stopping the emulator. Capture paths must be absolute, end in
 directory. Keep captures outside this repository; recorded game audio is game
 content.
 
+## Memory research
+
+All research reads use the same GDB session discipline as `xemu_read`: the guest
+is paused for the whole operation (so one search, capture or struct read is a
+consistent sample) and its previous run state is restored afterwards. Typed
+values are little-endian `u8`, `i8`, `u16`, `i16`, `u32`, `i32` or `f32`.
+
+`xemu_mem_search` scans up to 64 MiB in 64 KiB GDB reads (512-byte packets).
+Integers accept decimal or `0x` strings or JSON numbers and must fit the type;
+`f32` matches `abs(value - target) <= tolerance` (finite values only). A
+`pattern` value is hex pairs with `??` wildcards, e.g. `"8b 45 ?? 89"` (1–256
+bytes, at least one fixed). `alignment` is 1, 2 or 4 relative to absolute
+addresses (default: the type size; 1 for patterns). Matches may straddle chunk
+boundaries. A chunk the stub refuses is retried page by page; unreadable 4 KiB
+pages are skipped and listed in `unreadable`. Scanning stops after `max_results`
+and sets `truncated`. Expect large ranges to take tens of seconds while the
+guest is paused.
+
+`xemu_mem_capture` stores up to 16 MiB server-side (at most 8 handles, in
+memory only, never on disk) with a type and alignment. `xemu_mem_diff` re-reads
+and lists positions whose bytes changed with old/new typed values (`rebase`
+makes the new read the baseline). `xemu_mem_narrow` is a cheat-finder step:
+`changed`, `unchanged`, `increased`, `decreased` (against the previous read) or
+`equals` (`value`, with `tolerance` for `f32`). The first narrow considers every
+aligned readable position; each narrow keeps the surviving candidates and makes
+its read the next baseline. Typical flow: capture, take damage in game, narrow
+`decreased`, wait, narrow `unchanged`, then `equals` the displayed number.
+
+`xemu_read_struct` decodes fields `name:type@offset`, where type is a scalar,
+`scalar[N]` (N ≤ 256), `cstring[N]` / `bytes[N]` (N ≤ 1024), `ptr` (hex) or
+`ptr->Name` to follow into `structs[Name]`. Each struct spans at most 4096 bytes;
+following stops at `max_depth` hops, 64 structs or 64 KiB in total. Null pointers
+decode as `null`; cycles, depth cut-offs and unreadable targets are reported in
+place. Example: `fields=["hp:f32@0x40", "pos:f32[3]@0x10", "next:ptr->Actor@0x4"]`,
+`structs={"Actor": ["hp:f32@0x40", "next:ptr->Actor@0x4"]}`.
+
+## Breakpoints and watchpoints
+
+`xemu_break_set` registers points server-side: `exec` (GDB `Z0`), `write`
+(`Z2`), `read` (`Z3`) or `access` (`Z4`); watchpoints are 1, 2, 4 or 8 bytes,
+aligned. Nothing is inserted into the guest at that time. `xemu_break_wait`
+pauses, sends `?` (QEMU's stub clears stale debugger points on it), inserts every
+point, continues and waits up to `timeout_s`. A hit returns the stop reply,
+matched point ids, the 16 general registers from the GDB `g` packet, a
+`stack_bytes` window at ESP (hex and u32 words) and a `window_bytes` window at
+the watch address (aligned down to 16) or EIP. On timeout it sends GDB `^C`,
+then QMP `stop` if the stub stays silent, and reports `interrupted`.
+
+Points are **always removed** before the call returns: by `z` packets, or — if
+the GDB stream broke — over a fresh connection (`?` plus `z`). The final state is
+always the requested `leave`: `paused` (default, closes GDB without the resuming
+`D`) or `running` (detaches). This applies to errors and cancellation too, so a
+guest is never left halted in a debugger stop with nobody attached. x86
+watchpoints report after the accessing instruction, so EIP is normally the next
+instruction. The MCP client's own request timeout must exceed `timeout_s`.
+
+## Scripted input
+
+`xemu_input_sequence` runs up to 200 steps (≤ 300 s in total) through the same
+targeted delivery as `xemu_press`. Each step is `{"buttons": [...]}` or
+`{"button": "a"}` with `hold_ms` (1–10000, default 100) and `wait_ms` after
+release (0–60000, default 0). Every step is validated and resolved to scancodes
+before any key is sent; keys are released after each hold, including on
+cancellation, and the server lock is held for the whole sequence. `dry_run=true`
+returns the resolved plan without an emulator or window (Linux-friendly). As with
+`xemu_press`, delivery does not prove the game consumed the input.
+
+## Snapshot catalogue
+
+With `snapshot_catalog` configured, successful `xemu_save_state` calls record
+`{tag, description, zone, notes, created, updated}` in that private JSON file
+(written atomically); `xemu_load_state` adds `last_loaded` and
+`xemu_delete_state` removes the entry. A catalogue failure after a successful
+HMP command is returned as `catalog_error` rather than hiding the snapshot
+result. `xemu_state_list` searches tag/description/zone/notes and filters by
+zone; `check_emulator=true` compares against HMP `info snapshots` (`present`
+per entry plus `uncatalogued` tags). `xemu_state_annotate` edits metadata
+without contacting the emulator. The catalogue must be outside this repository;
+descriptions are your notes, so keep game text out of the repo as usual.
+
 ## Real-emulator smoke test
 
 This is opt-in: it launches xemu, sends real controller input, saves/loads a
@@ -235,7 +330,11 @@ also be checked visually.
 Tests use synthetic socket peers and invented bytes; no console assets required.
 They cover QMP negotiation/event handling/timeouts, GDB framing/checksums/RLE,
 memory errors/state restoration, write guards/read-back, snapshot validation,
-controller release on cancellation, and a real MCP stdio subprocess. The content
+controller release on cancellation, and a real MCP stdio subprocess. The
+research tests use a fake QMP/GDB peer with unmapped pages, `Z`/`z` points,
+continue, `^C` and a wedged-stub mode to cover search, capture/narrow, struct
+decoding, breakpoint arming/removal and final run state, the catalogue and
+input sequences. The content
 validator checks the Git index against a source-file allowlist and rejects
 binary/runtime files and private machine paths. It is a cheap guard, not proof
 of provenance; review the staged diff before pushing.

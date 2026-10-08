@@ -12,14 +12,17 @@ import subprocess
 import time
 import tomllib
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import psutil
 import anyio
 
-from .protocols import GDB, QMP, ProtocolError
+from . import research
+from .protocols import GDB, QMP, GDBErrorReply, ProtocolError, parse_stop_reply
+from .research import (CAPTURE_HANDLES, CAPTURE_LIMIT, CHUNK, PAGE, RESULT_LIMIT, SEARCH_LIMIT,
+                       Capture, Matcher, SnapshotCatalog, check_alignment, check_int, json_value)
 from .windows import capture_region, controller_keys, post_key, validate_windows_keys, window_for_pid
 
 
@@ -34,6 +37,7 @@ class Config:
     startup_timeout: float = 60
     allowed_game_roots: list[str] = field(default_factory=list)
     audiodev: str | None = None
+    snapshot_catalog: str | None = None
 
     def __post_init__(self):
         for port in (self.qmp_port, self.gdb_port):
@@ -56,6 +60,10 @@ class Config:
                 or any(not isinstance(root, str) or not Path(root).is_absolute()
                        for root in self.allowed_game_roots)):
             raise ValueError('allowed_game_roots must be a list of absolute paths')
+        if self.snapshot_catalog is not None:
+            if not isinstance(self.snapshot_catalog, str):
+                raise ValueError('snapshot_catalog must be an absolute .json path')
+            SnapshotCatalog(self.snapshot_catalog)
 
     @classmethod
     def load(cls, path=None):
@@ -68,6 +76,10 @@ class Config:
         if unknown:
             raise ValueError(f'Unknown configuration keys: {sorted(unknown)}')
         return cls(**data)
+
+
+# GDB RSP Z/z point types for software breakpoints and write/read/access watchpoints.
+POINT_KINDS = {'exec': 0, 'write': 2, 'read': 3, 'access': 4}
 
 
 def validate_range(address, length):
@@ -117,6 +129,12 @@ class Emulator:
         self.commands = set()
         self.keymap = {}
         self.lock = asyncio.Lock()
+        self.gdb_timeout = 10
+        self.captures = {}
+        self.capture_serial = 0
+        self.points = {}
+        self.point_serial = 0
+        self.catalog = SnapshotCatalog(config.snapshot_catalog) if config.snapshot_catalog else None
 
     def _require_owned(self):
         if self.process is None or self.process.poll() is not None:
@@ -276,15 +294,18 @@ class Emulator:
             return await self._status()
 
     @asynccontextmanager
-    async def _memory_session(self):
+    async def _memory_session(self, leave=None):
+        # leave=None restores the caller's run state; True/False choose it.
         self._require_owned()
         running = None
-        gdb = GDB('127.0.0.1', self.config.gdb_port)
+        gdb = GDB('127.0.0.1', self.config.gdb_port, self.gdb_timeout)
         try:
             # Do not leave an uncertain stop command in flight when an SDK
             # cancellation scope expires. QMP requests have bounded timeouts.
             with anyio.CancelScope(shield=True):
                 running = (await self.qmp.execute('query-status'))['running']
+                if leave is not None:
+                    running = leave
                 await self.qmp.execute('stop')
             await gdb.connect()
             yield gdb
@@ -353,9 +374,10 @@ class Emulator:
         pairs = re.findall(r'\b([A-Z][A-Z0-9]{1,7})=([0-9a-fA-F]+)\b', text)
         return {'registers': {name: '0x' + value for name, value in pairs}, 'raw': text}
 
-    async def snapshot(self, action, tag):
+    async def snapshot(self, action, tag, description=None, zone=None, notes=None):
         if action not in ('save', 'load', 'delete') or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', tag):
             raise ValueError('Snapshot tag must be 1 to 64 ASCII letters, digits, underscore or hyphen')
+        SnapshotCatalog.check_text({'description': description, 'zone': zone, 'notes': notes})
         async with self.lock:
             self._require_owned()
             if action == 'save' and not (await self.qmp.execute('query-status'))['running']:
@@ -367,7 +389,61 @@ class Emulator:
             # as a QMP success string, not a QMP error object.
             if output.strip():
                 raise RuntimeError(f'Snapshot {action} failed: {output.strip()}')
-        return {'tag': tag, 'action': action, 'ok': True}
+        result = {'tag': tag, 'action': action, 'ok': True}
+        if self.catalog is None:
+            return result
+        # The snapshot itself succeeded; a catalogue problem is reported, not raised.
+        try:
+            if action == 'save':
+                result['catalog'] = self.catalog.record(tag, saved=True, description=description,
+                                                        zone=zone, notes=notes)
+            elif action == 'load':
+                result['catalog'] = self.catalog.touch(tag, 'last_loaded')
+            else:
+                result['catalog'] = self.catalog.remove(tag)
+        except (OSError, TypeError, ValueError) as exc:
+            result['catalog_error'] = str(exc)
+        return result
+
+    def _require_catalog(self):
+        if self.catalog is None:
+            raise RuntimeError('No snapshot_catalog configured; set an absolute .json path outside '
+                               'the repository in the private server config')
+        return self.catalog
+
+    async def state_list(self, query='', zone=None, check_emulator=False):
+        catalog = self._require_catalog()
+        if not isinstance(query, str) or (zone is not None and not isinstance(zone, str)):
+            raise ValueError('query and zone must be strings')
+        entries = catalog.search(query, zone)
+        result = {'catalog': str(catalog.path), 'count': len(entries), 'snapshots': entries}
+        if check_emulator:
+            async with self.lock:
+                self._require_owned()
+                text = await self.qmp.hmp('info snapshots')
+            tags = self._snapshot_tags(text)
+            for entry in entries:
+                entry['present'] = entry['tag'] in tags
+            result['uncatalogued'] = sorted(tags - set(catalog.load()))
+        return result
+
+    @staticmethod
+    def _snapshot_tags(text):
+        # HMP 'info snapshots': a header line starting "ID TAG", then one row per snapshot.
+        tags, rows = set(), False
+        for line in text.splitlines():
+            columns = line.split()
+            if columns[:2] == ['ID', 'TAG']:
+                rows = True
+            elif rows and len(columns) >= 2:
+                tags.add(columns[1])
+        return tags
+
+    def state_annotate(self, tag, description=None, zone=None, notes=None):
+        if not isinstance(tag, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', tag):
+            raise ValueError('Snapshot tag must be 1 to 64 ASCII letters, digits, underscore or hyphen')
+        return {'snapshot': self._require_catalog().record(tag, description=description,
+                                                           zone=zone, notes=notes)}
 
     async def audio_devices(self):
         async with self.lock:
@@ -435,22 +511,49 @@ class Emulator:
     async def press(self, buttons, hold_ms=100):
         if type(hold_ms) is not int or not 1 <= hold_ms <= 10000:
             raise ValueError('hold_ms must be an integer from 1 to 10000')
-        keys = controller_keys(buttons, self.keymap)
-        validate_windows_keys(keys)
+        keys = self._resolve_keys(buttons)
         async with self.lock:
             self._require_owned()
             hwnd = window_for_pid(self.process.pid)
-            pressed = []
-            try:
-                for scan in keys:
-                    post_key(hwnd, scan, True, self.process.pid)
-                    pressed.append(scan)
-                await asyncio.sleep(hold_ms / 1000)
-            finally:
-                for scan in reversed(pressed):
-                    post_key(hwnd, scan, False, self.process.pid)
+            await self._deliver(hwnd, keys, hold_ms)
         return {'buttons': buttons, 'hold_ms': hold_ms, 'sdl_scancodes': keys,
                 'backend': 'windows-targeted-keyboard', 'analog': False}
+
+    def _resolve_keys(self, buttons):
+        keys = controller_keys(buttons, self.keymap)
+        validate_windows_keys(keys)
+        return keys
+
+    async def _deliver(self, hwnd, keys, hold_ms):
+        pressed = []
+        try:
+            for scan in keys:
+                post_key(hwnd, scan, True, self.process.pid)
+                pressed.append(scan)
+            await asyncio.sleep(hold_ms / 1000)
+        finally:
+            for scan in reversed(pressed):
+                post_key(hwnd, scan, False, self.process.pid)
+
+    async def input_sequence(self, steps, dry_run=False):
+        """Run validated (buttons, hold_ms, wait_ms) steps; every press is released."""
+        plan, total = research.plan_sequence(steps, self._resolve_keys)
+        result = {'steps': plan, 'total_ms': total, 'dry_run': bool(dry_run),
+                  'backend': 'windows-targeted-keyboard', 'analog': False, 'executed': 0}
+        if dry_run:
+            # Validation and scancode resolution only: no ownership or window needed.
+            return result
+        async with self.lock:
+            self._require_owned()
+            hwnd = window_for_pid(self.process.pid)
+            started = time.monotonic()
+            for index, step in enumerate(plan):
+                await self._deliver(hwnd, step['sdl_scancodes'], step['hold_ms'])
+                result['executed'] = index + 1
+                if step['wait_ms']:
+                    await asyncio.sleep(step['wait_ms'] / 1000)
+            result['elapsed_ms'] = round((time.monotonic() - started) * 1000)
+        return result
 
     async def screenshot(self, filename, include_base64=False, bring_to_front=False):
         path = Path(filename).expanduser()
@@ -489,6 +592,329 @@ class Emulator:
                 result['mime_type'] = 'image/png'
                 result['base64'] = base64.b64encode(path.read_bytes()).decode('ascii')
             return result
+
+    # Bounded memory research: search, captures/narrowing, typed structs.
+
+    @staticmethod
+    async def _iter_readable(gdb, address, length, holes):
+        """Yield (address, bytes) readable pieces; add unreadable 4 KiB pages to holes."""
+        offset = 0
+        while offset < length:
+            start = address + offset
+            end = min(address + length, (start // CHUNK + 1) * CHUNK)
+            try:
+                data = await gdb.read(start, end - start)
+            except GDBErrorReply:
+                data = None
+            if data is not None:
+                yield start, data
+            else:
+                page = start
+                while page < end:
+                    stop = min(end, (page // PAGE + 1) * PAGE)
+                    try:
+                        data = await gdb.read(page, stop - page)
+                    except GDBErrorReply:
+                        holes.add(page // PAGE)
+                    else:
+                        yield page, data
+                    page = stop
+            offset = end - address
+
+    async def _read_sparse(self, gdb, address, length):
+        data = bytearray(length)
+        holes = set()
+        async with aclosing(self._iter_readable(gdb, address, length, holes)) as pieces:
+            async for start, chunk in pieces:
+                data[start - address:start - address + len(chunk)] = chunk
+        pages = range(address // PAGE, (address + length - 1) // PAGE + 1)
+        if all(page in holes for page in pages):
+            raise RuntimeError(f'No readable memory in {hex(address)}..{hex(address + length)}')
+        return data, holes
+
+    async def search(self, address, length, value_type, value, tolerance=0.0, alignment=None,
+                     max_results=100):
+        start = self._validate_region(address, length, SEARCH_LIMIT)
+        check_int('max_results', max_results, 1, RESULT_LIMIT)
+        matcher = Matcher(value_type, value, tolerance, alignment)
+        results, truncated = [], False
+        holes = set()
+        async with self.lock, self._memory_session() as gdb, \
+                aclosing(self._iter_readable(gdb, start, length, holes)) as pieces:
+            carry_address, carry = None, b''
+            async for piece, data in pieces:
+                if carry_address is not None and carry_address + len(carry) == piece:
+                    piece, data = carry_address, carry + data
+                for found, found_value in matcher.find(piece, data):
+                    if len(results) == max_results:
+                        truncated = True
+                        break
+                    results.append({'address': hex(found), 'value': json_value(found_value)})
+                if truncated:
+                    break
+                keep = min(len(data), matcher.size - 1)
+                carry_address, carry = piece + len(data) - keep, data[len(data) - keep:]
+        unreadable, more = research.merge_holes(holes)
+        return {'address': hex(start), 'length': length, 'value_type': value_type,
+                'alignment': matcher.alignment, 'count': len(results), 'truncated': truncated,
+                'results': results, 'unreadable': unreadable, 'unreadable_truncated': more}
+
+    @staticmethod
+    def _validate_region(address, length, limit):
+        try:
+            value = int(address, 0) if isinstance(address, str) else address
+        except ValueError as exc:
+            raise ValueError('Address must be decimal or 0x-prefixed hexadecimal') from exc
+        if type(value) is not int or type(length) is not int:
+            raise ValueError('Address and length must be integers')
+        if not 1 <= length <= limit or not 0 <= value < 2**32 or value + length > 2**32:
+            raise ValueError(f'Range must fit 32-bit memory and be 1 to {limit} bytes')
+        return value
+
+    async def capture(self, address, length, value_type='u32', alignment=None):
+        start = self._validate_region(address, length, CAPTURE_LIMIT)
+        size = research.scalar_size(value_type)
+        alignment = check_alignment(alignment, size)
+        if len(self.captures) >= CAPTURE_HANDLES:
+            raise RuntimeError(f'At most {CAPTURE_HANDLES} captures are kept; release one with xemu_mem_release')
+        async with self.lock, self._memory_session() as gdb:
+            data, holes = await self._read_sparse(gdb, start, length)
+        self.capture_serial += 1
+        handle = f'mem-{self.capture_serial}'
+        self.captures[handle] = Capture(handle, start, length, value_type, alignment, bytes(data), holes)
+        return self.captures[handle].summary()
+
+    def _capture(self, handle):
+        if handle not in self.captures:
+            raise ValueError(f'Unknown capture handle {handle!r}; list them with xemu_mem_captures')
+        return self.captures[handle]
+
+    async def _recapture(self, capture):
+        async with self.lock, self._memory_session() as gdb:
+            return await self._read_sparse(gdb, capture.address, capture.length)
+
+    async def diff(self, handle, max_results=100, rebase=False):
+        capture = self._capture(handle)
+        check_int('max_results', max_results, 1, RESULT_LIMIT)
+        new, holes = await self._recapture(capture)
+        results, count = [], 0
+        for offset in capture.changed(new, holes):
+            count += 1
+            if len(results) < max_results:
+                results.append({'offset': hex(offset), 'address': hex(capture.address + offset),
+                                'old': json_value(capture.value(capture.data, offset)),
+                                'new': json_value(capture.value(new, offset))})
+        if rebase:
+            capture.data, capture.holes = bytes(new), set(holes)
+        return {'handle': handle, 'value_type': capture.value_type, 'changed': count,
+                'truncated': count > len(results), 'rebased': bool(rebase), 'results': results}
+
+    async def narrow(self, handle, condition, value=None, tolerance=0.0, max_results=100):
+        capture = self._capture(handle)
+        check_int('max_results', max_results, 1, RESULT_LIMIT)
+        if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool) \
+                or not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError('tolerance must be a finite number >= 0')
+        if tolerance and (capture.value_type != 'f32' or condition != 'equals'):
+            raise ValueError('tolerance applies only to f32 equals')
+        if condition == 'equals':
+            research.parse_number(capture.value_type, value)
+        elif condition not in research.CONDITIONS:
+            raise ValueError(f'condition must be one of {", ".join(research.CONDITIONS)}')
+        previous = capture.data
+        new, holes = await self._recapture(capture)
+        kept = capture.narrow(new, holes, condition, value, tolerance)
+        results = [{'address': hex(capture.address + offset),
+                    'previous': json_value(capture.value(previous, offset)),
+                    'value': json_value(capture.value(new, offset))} for offset in kept[:max_results]]
+        return {'handle': handle, 'condition': condition, 'candidates': len(kept),
+                'truncated': len(kept) > len(results), 'narrowed': capture.narrowed, 'results': results}
+
+    def captures_list(self):
+        return {'captures': [capture.summary() for capture in self.captures.values()],
+                'limit': CAPTURE_HANDLES}
+
+    def capture_release(self, handle):
+        self._capture(handle)
+        del self.captures[handle]
+        return {'handle': handle, 'released': True}
+
+    async def read_struct(self, address, fields, structs=None, max_depth=1):
+        root = validate_range(address, 1)
+        check_int('max_depth', max_depth, 0, 4)
+        structs = structs or {}
+        if not isinstance(structs, dict) or len(structs) > 16:
+            raise ValueError('structs must map up to 16 names to field spec lists')
+        names = set(structs)
+        specs = {name: research.parse_fields(spec, names) for name, spec in structs.items()}
+        root_spec = research.parse_fields(fields, names)
+        budget = {'nodes': 64, 'bytes': 64 * 1024}
+
+        async def decode_at(gdb, where, spec, depth, path):
+            length = research.span(spec)
+            if budget['nodes'] <= 0 or budget['bytes'] < length:
+                return {'address': hex(where), 'truncated': 'read budget exhausted'}
+            budget['nodes'] -= 1
+            budget['bytes'] -= length
+            try:
+                validate_range(where, length)
+                data = await gdb.read(where, length)
+            except (GDBErrorReply, ValueError) as exc:
+                return {'address': hex(where), 'error': str(exc)}
+            decoded = {}
+            for item in spec:
+                value = research.decode_field(item, data)
+                if item.kind != 'ptr':
+                    decoded[item.name] = value
+                elif item.target is None or value == 0:
+                    decoded[item.name] = hex(value) if item.target is None else None
+                elif (value, item.target) in path:
+                    decoded[item.name] = {'address': hex(value), 'cycle': True}
+                elif depth >= max_depth:
+                    decoded[item.name] = {'address': hex(value), 'truncated': 'max_depth'}
+                else:
+                    decoded[item.name] = await decode_at(gdb, value, specs[item.target], depth + 1,
+                                                         path | {(value, item.target)})
+                    decoded[item.name]['struct'] = item.target
+            return {'address': hex(where), 'fields': decoded}
+
+        async with self.lock, self._memory_session() as gdb:
+            result = await decode_at(gdb, root, root_spec, 0, frozenset({(root, None)}))
+        if 'error' in result:
+            raise RuntimeError(f'Struct read at {hex(root)} failed: {result["error"]}')
+        result['max_depth'] = max_depth
+        return result
+
+    # Breakpoints/watchpoints are kept server-side and armed only while
+    # xemu_break_wait runs; they are never left inserted between calls.
+
+    def break_set(self, address, kind='exec', length=1):
+        value = validate_range(address, 1)
+        if kind not in POINT_KINDS:
+            raise ValueError(f'kind must be one of {", ".join(POINT_KINDS)}')
+        if kind == 'exec':
+            if length != 1:
+                raise ValueError('exec breakpoints use length 1')
+        elif length not in (1, 2, 4, 8) or value % length:
+            raise ValueError('watchpoint length must be 1, 2, 4 or 8 and the address aligned to it')
+        if len(self.points) >= 16:
+            raise RuntimeError('At most 16 breakpoints/watchpoints may be set')
+        for point in self.points.values():
+            if (point['kind'], point['address'], point['length']) == (kind, hex(value), length):
+                raise ValueError(f'Identical point already set as {point["id"]}')
+        self.point_serial += 1
+        point = {'id': f'bp-{self.point_serial}', 'kind': kind, 'address': hex(value),
+                 'length': length, 'z': POINT_KINDS[kind], 'hits': 0}
+        self.points[point['id']] = point
+        return {'point': point, 'armed': False,
+                'note': 'Points are inserted only while xemu_break_wait runs'}
+
+    def break_clear(self, point_id=None):
+        if point_id is None:
+            cleared = sorted(self.points)
+            self.points.clear()
+        else:
+            if point_id not in self.points:
+                raise ValueError(f'Unknown point {point_id!r}')
+            del self.points[point_id]
+            cleared = [point_id]
+        return {'cleared': cleared, 'remaining': len(self.points)}
+
+    def break_list(self):
+        return {'points': list(self.points.values())}
+
+    async def _disarm(self, gdb, armed):
+        """Remove inserted points; on a broken stream reconnect and clear them."""
+        if not armed:
+            return
+        if not gdb.broken and gdb.writer is not None:
+            try:
+                for point in armed:
+                    await gdb.clear_point(point['z'], int(point['address'], 16), point['length'])
+                return
+            except (OSError, ProtocolError, TimeoutError):
+                pass
+        # QEMU's stub accepts one client: drop the broken socket, then use a
+        # fresh connection. Its '?' handler also removes every GDB point.
+        await gdb.close()
+        fresh = GDB('127.0.0.1', self.config.gdb_port, self.gdb_timeout)
+        try:
+            await fresh.connect()
+            await fresh.request('?')
+            for point in armed:
+                try:
+                    await fresh.clear_point(point['z'], int(point['address'], 16), point['length'])
+                except ProtocolError:
+                    pass
+        finally:
+            await fresh.close()
+
+    async def _window(self, gdb, address, length):
+        try:
+            validate_range(address, length)
+            data = await gdb.read(address, length)
+        except (GDBErrorReply, ValueError) as exc:
+            return {'address': hex(address), 'error': str(exc)}
+        return {'address': hex(address), 'hex': data.hex()}
+
+    async def break_wait(self, timeout_s=10, leave='paused', stack_bytes=64, window_bytes=32):
+        if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool)
+                or not math.isfinite(timeout_s) or not 0.05 <= timeout_s <= 120):
+            raise ValueError('timeout_s must be 0.05 to 120 seconds')
+        if leave not in ('paused', 'running'):
+            raise ValueError("leave must be 'paused' or 'running'")
+        check_int('stack_bytes', stack_bytes, 0, 1024)
+        check_int('window_bytes', window_bytes, 0, 4096)
+        if stack_bytes % 4:
+            raise ValueError('stack_bytes must be a multiple of 4')
+        if not self.points:
+            raise ValueError('No breakpoints/watchpoints set; use xemu_break_set first')
+        points = list(self.points.values())
+        async with self.lock, self._memory_session(leave=leave == 'running') as gdb:
+            armed = []
+            try:
+                # QEMU clears stale GDB points on '?'; also confirms the stub.
+                await gdb.request('?')
+                for point in points:
+                    await gdb.set_point(point['z'], int(point['address'], 16), point['length'])
+                    armed.append(point)
+                reply, interrupted = await gdb.resume_until_stop(
+                    timeout_s, interrupt=lambda: self.qmp.execute('stop'))
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await self._disarm(gdb, armed)
+            stop = parse_stop_reply(reply)
+            if stop['kind'] in ('W', 'X'):
+                raise RuntimeError(f'GDB stub reported target exit: {reply[:40]}')
+            registers = await gdb.registers()
+            matched = self._match_points(points, stop, registers['EIP'])
+            result = {'hit': bool(matched) or (not interrupted and stop['signal'] == 5),
+                      'interrupted': interrupted, 'matched': [p['id'] for p in matched],
+                      'stop': {key: value for key, value in stop.items() if key != 'watch'},
+                      'registers': {name: f'0x{value:08x}' for name, value in registers.items()},
+                      'leave': leave}
+            if 'watch' in stop:
+                result['stop']['watch'] = {'type': stop['watch']['type'],
+                                           'address': hex(stop['watch']['address'])}
+            if stack_bytes:
+                stack = await self._window(gdb, registers['ESP'], stack_bytes)
+                if 'hex' in stack:
+                    stack['u32'] = [value for (value,) in struct.iter_unpack('<I', bytes.fromhex(stack['hex']))]
+                result['stack'] = stack
+            if window_bytes:
+                focus = stop['watch']['address'] & ~0xF if 'watch' in stop else registers['EIP']
+                result['window'] = await self._window(gdb, focus, window_bytes)
+            for point in matched:
+                point['hits'] += 1
+        return result
+
+    @staticmethod
+    def _match_points(points, stop, eip):
+        if 'watch' in stop:
+            address = stop['watch']['address']
+            return [point for point in points if point['kind'] != 'exec'
+                    and int(point['address'], 16) <= address < int(point['address'], 16) + point['length']]
+        return [point for point in points if point['kind'] == 'exec' and int(point['address'], 16) == eip]
 
     def symbols(self, query=''):
         if not self.config.symbols_file:

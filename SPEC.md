@@ -27,6 +27,22 @@ parameters, attached to a named audiodev reported by the emulator itself.
 Monitor errors are surfaced even when QMP reports success; recorded audio is
 game content and stays outside this repository.
 
+Research reads (search, captures, struct decoding) hold the guest paused for
+one bounded operation and restore its run state: search ≤ 64 MiB, capture
+≤ 16 MiB with at most 8 in-memory handles, structs ≤ 4096 bytes each, ≤ 64
+structs / 64 KiB per call, results ≤ 1000. Only GDB `E` replies are treated as
+unreadable pages; other protocol failures abort the operation.
+
+Breakpoints/watchpoints live only in server memory between calls. They are
+inserted for the duration of one `xemu_break_wait` and always removed before it
+returns, over a fresh GDB connection if the stream broke. Waits are bounded; a
+silent stub is interrupted with `^C`, then QMP stop. The final run state is
+always the caller's `leave` choice, including on error or cancellation.
+
+Scripted input validates every step before sending a key and releases each
+step's keys. The snapshot catalogue is a private JSON file outside the
+repository; catalogue failures never mask the HMP snapshot result.
+
 ## V-TBD (number assigned at merge)
 
 `tools/check_no_game_content.py --all` restricts the Git index to the explicit
