@@ -24,7 +24,11 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                     'xemu_registers', 'xemu_save_state', 'xemu_load_state',
                     'xemu_delete_state', 'xemu_screenshot', 'xemu_symbols',
                     'xemu_audio_devices', 'xemu_audio_capture_start',
-                    'xemu_audio_capture_stop',
+                    'xemu_audio_capture_stop', 'xemu_state_list', 'xemu_state_annotate',
+                    'xemu_input_sequence', 'xemu_mem_search', 'xemu_mem_capture',
+                    'xemu_mem_diff', 'xemu_mem_narrow', 'xemu_mem_captures',
+                    'xemu_mem_release', 'xemu_read_struct', 'xemu_break_set',
+                    'xemu_break_clear', 'xemu_break_list', 'xemu_break_wait',
                 })
                 result = await session.call_tool('xemu_symbols', {'query': 'invented'})
                 self.assertFalse(result.isError)
@@ -32,6 +36,16 @@ class StdioTests(unittest.IsolatedAsyncioTestCase):
                 failure = await session.call_tool('xemu_status', {})
                 self.assertTrue(failure.isError)
                 self.assertIn('owned', failure.content[0].text)
+                planned = await session.call_tool('xemu_input_sequence', {
+                    'steps': [{'button': 'a', 'hold_ms': 50, 'wait_ms': 100}], 'dry_run': True})
+                self.assertFalse(planned.isError)
+                self.assertEqual(planned.structuredContent['steps'][0]['sdl_scancodes'], [4])
+                point = await session.call_tool('xemu_break_set', {'address': '0x1000', 'kind': 'write',
+                                                                   'length': 4})
+                self.assertEqual(point.structuredContent['point']['id'], 'bp-1')
+                waited = await session.call_tool('xemu_break_wait', {'timeout_s': 1})
+                self.assertTrue(waited.isError)
+                self.assertIn('owned', waited.content[0].text)
                 guarded = await session.call_tool('xemu_write', {'address': '0x100', 'hex_data': '01'})
                 self.assertTrue(guarded.isError)
                 self.assertIn('disabled', guarded.content[0].text)
