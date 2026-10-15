@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from PIL import Image
@@ -48,6 +49,20 @@ class ValidationTests(unittest.TestCase):
             path.write_text('{"allow_write": "false"}')
             with self.assertRaises(ValueError):
                 Config.load(path)
+
+    def test_config_validates_protected_processes(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(Config().protected_processes, [])
+        self.assertEqual(Config(protected_processes=['ExampleGame.exe']).protected_processes,
+                         ['ExampleGame.exe'])
+        for bad in ('ExampleGame.exe', [''], ['  '], ['games/ExampleGame.exe'],
+                    ['games\\ExampleGame.exe'], [42]):
+            with self.assertRaises(ValueError):
+                Config(protected_processes=bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'server.json'
+            path.write_text('{"protected_processes": ["ExampleGame.exe"]}')
+            self.assertEqual(Config.load(path).protected_processes, ['ExampleGame.exe'])
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):

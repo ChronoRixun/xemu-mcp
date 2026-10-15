@@ -36,6 +36,7 @@ class Config:
     symbols_file: str | None = None
     startup_timeout: float = 60
     allowed_game_roots: list[str] = field(default_factory=list)
+    protected_processes: list[str] = field(default_factory=list)
     audiodev: str | None = None
     snapshot_catalog: str | None = None
 
@@ -60,6 +61,17 @@ class Config:
                 or any(not isinstance(root, str) or not Path(root).is_absolute()
                        for root in self.allowed_game_roots)):
             raise ValueError('allowed_game_roots must be a list of absolute paths')
+        if not self.protected_processes:
+            listed = os.environ.get('XEMU_MCP_PROTECTED_PROCESSES')
+            if listed:
+                self.protected_processes = [name.strip() for name in re.split(r'[,;]', listed)
+                                            if name.strip()]
+        if (not isinstance(self.protected_processes, list)
+                or any(not isinstance(name, str) or not name.strip()
+                       or '/' in name or '\\' in name
+                       for name in self.protected_processes)):
+            raise ValueError('protected_processes must be a list of process names without path separators')
+        self.protected_processes = [name.strip() for name in self.protected_processes]
         if self.snapshot_catalog is not None:
             if not isinstance(self.snapshot_catalog, str):
                 raise ValueError('snapshot_catalog must be an absolute .json path')
@@ -156,11 +168,12 @@ class Emulator:
             raise RuntimeError('QMP/GDB listeners do not belong to the owned xemu process')
 
     def _check_games(self):
+        protected = {name.lower() for name in self.config.protected_processes}
         for process in psutil.process_iter(['name', 'exe']):
             name = (process.info['name'] or '').lower()
             if name in ('xemu', 'xemu.exe'):
                 raise RuntimeError(f'Another xemu is already running (PID {process.pid}); refusing to attach or start')
-            if name == 'xmen2.exe':
+            if name in protected:
                 exe = (process.info['exe'] or '').replace('\\', '/').lower()
                 allowed = [root.replace('\\', '/').lower().rstrip('/') + '/'
                            for root in self.config.allowed_game_roots]

@@ -1,4 +1,4 @@
-"""V-TBD: inexpensive source-only Git-index guard (number assigned at merge)."""
+"""Inexpensive source-only Git-index guard."""
 
 import argparse
 import re
@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ALLOWED_ROOTS = {'README.md', 'SPEC.md', '.gitignore', 'pyproject.toml'}
+ALLOWED_ROOTS = {'README.md', 'SPEC.md', 'LICENSE', '.gitignore', 'pyproject.toml'}
 SOURCE_DIRS = {'xemu_mcp', 'tests', 'scripts', 'tools'}
 
 
