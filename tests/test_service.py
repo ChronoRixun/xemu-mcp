@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from PIL import Image
@@ -48,6 +49,34 @@ class ValidationTests(unittest.TestCase):
             path.write_text('{"allow_write": "false"}')
             with self.assertRaises(ValueError):
                 Config.load(path)
+
+    def test_config_validates_protected_processes(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(Config().protected_processes, [])
+        self.assertEqual(Config(protected_processes=['ExampleGame.exe']).protected_processes,
+                         ['ExampleGame.exe'])
+        for bad in ('ExampleGame.exe', [''], ['  '], ['games/ExampleGame.exe'],
+                    ['games\\ExampleGame.exe'], [42]):
+            with self.assertRaises(ValueError):
+                Config(protected_processes=bad)
+        # Falsy non-lists raise even when the env var is set; only a missing
+        # key or an empty list falls back to the environment.
+        env = {'XEMU_MCP_PROTECTED_PROCESSES': 'ExampleGame.exe'}
+        for bad in (None, ''):
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(ValueError):
+                    Config(protected_processes=bad)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(Config(protected_processes=[]).protected_processes, ['ExampleGame.exe'])
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'server.json'
+                path.write_text('{"protected_processes": null}')
+                with self.assertRaises(ValueError):
+                    Config.load(path)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'server.json'
+            path.write_text('{"protected_processes": ["ExampleGame.exe"]}')
+            self.assertEqual(Config.load(path).protected_processes, ['ExampleGame.exe'])
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):

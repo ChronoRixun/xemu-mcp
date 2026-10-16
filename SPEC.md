@@ -43,7 +43,7 @@ Scripted input validates every step before sending a key and releases each
 step's keys. The snapshot catalogue is a private JSON file outside the
 repository; catalogue failures never mask the HMP snapshot result.
 
-## V-TBD (number assigned at merge)
+## Content guard
 
 `tools/check_no_game_content.py --all` restricts the Git index to the explicit
 source/documentation allowlist, UTF-8 text below 256 KiB, without NUL bytes or

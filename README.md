@@ -9,7 +9,10 @@ to an existing emulator. All debugging ports bind to `127.0.0.1`.
 
 Requires Python 3.11+, xemu, and your own legally obtained console boot files and
 game. Windows is required for keyboard-controller delivery and the region-capture
-fallback. QMP/GDB and the fork screenshot command are platform-independent.
+screenshot fallback. QMP/GDB control works with stock xemu; the lossless
+`xemu-screenshot` QMP command used by `xemu_screenshot` is provided only by the
+fork at https://github.com/ChronoRixun/xemu — with stock xemu the tool falls back
+to the Windows region capture described below.
 
 ```powershell
 python -m venv .venv
@@ -60,7 +63,8 @@ Create a private JSON server config, for example `C:/private/xemu/server.json`:
   "gdb_port": 1234,
   "allow_write": false,
   "startup_timeout": 60,
-  "allowed_game_roots": []
+  "allowed_game_roots": [],
+  "protected_processes": []
 }
 ```
 
@@ -71,7 +75,13 @@ has a named backend to attach to; `"none,id=capture0"` captures without playing
 sound on the host. Optional `snapshot_catalog` is an absolute `.json` path outside
 this repository (its directory must exist) where snapshot tags, descriptions,
 zones and notes are recorded; see *Snapshot catalogue*. No symbols or console/game files are distributed here. Unknown
-config keys are errors; `allow_write` must be a JSON boolean. These are the
+config keys are errors; `allow_write` must be a JSON boolean. Optional
+`protected_processes` is a list of process names (for example `["ExampleGame.exe"]`)
+that must not run while the emulator runs: while any listed process is running
+outside `allowed_game_roots`, `xemu_start` refuses to start. The default is empty.
+The same list can be supplied without editing the config file via the
+`XEMU_MCP_PROTECTED_PROCESSES` environment variable (comma- or semicolon-separated
+process names); a nonempty config list takes precedence. These are the
 complete config keys.
 
 Add this to your MCP client's configuration after replacing the example paths:
@@ -144,10 +154,13 @@ error; it does not briefly resume them or silently change their state.
 
 `xemu_start` waits for port/protocol readiness, **not** the game's menu. A running
 guest, readable header and visible menu are separate observations. It refuses
-any existing xemu process or occupied port, and protects the project maintainer's
-play build by default by refusing any running `XMen2.exe`. An explicit private
+any existing xemu process or occupied port, and refuses to start while any process
+listed in `protected_processes` (or `XEMU_MCP_PROTECTED_PROCESSES`) is running,
+unless it runs from an explicitly allowed test-build root. Processes you list
+there are never signalled or closed by the server — listing one only blocks
+`xemu_start`. An explicit private
 `allowed_game_roots` list may permit other agents' isolated test builds to coexist;
-never list the maintainer's game or play-build directories. It does not stop other games. Abruptly killing the MCP
+never list your game or play-build directories. It does not stop other games. Abruptly killing the MCP
 server can bypass normal shutdown; identify the owned PID before manual cleanup.
 
 ## Input and screenshots
@@ -176,8 +189,11 @@ inject global keys into whatever application has focus. The child process uses
 changes before relying on input for evidence. A successful delivery result alone
 does not prove the game consumed the input.
 
-Screenshot capability is detected using QMP `query-commands`. If the running
-build provides `xemu-screenshot` with a `filename` argument, that command is used;
+Screenshot capability is detected using QMP `query-commands`. The
+`xemu-screenshot` QMP command is added by the xemu fork at
+https://github.com/ChronoRixun/xemu; stock xemu does not provide it. If the
+running build provides the `xemu-screenshot` command, it is used and is passed
+a `filename` argument;
 errors from it propagate rather than silently falling back. Otherwise Windows
 captures the visible client region, including xemu overlays and scaling. This is
 **not guest-resolution capture**. The window must be restored and unobscured;
@@ -338,3 +354,7 @@ input sequences. The content
 validator checks the Git index against a source-file allowlist and rejects
 binary/runtime files and private machine paths. It is a cheap guard, not proof
 of provenance; review the staged diff before pushing.
+
+## License
+
+[Apache License 2.0](LICENSE). Copyright 2026 ChronoRixun.

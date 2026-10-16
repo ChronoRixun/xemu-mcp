@@ -1,12 +1,16 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "xemu-mcp"
 version = "0.1.0"
 description = "Owned-process stdio MCP tools for the xemu Xbox emulator"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "ChronoRixun"}]
 dependencies = [
     "anyio>=4.5,<5",
     "mcp>=1.20,<2",
@@ -14,6 +18,9 @@ dependencies = [
     "psutil>=6,<8",
     "pywin32>=311; sys_platform == 'win32'",
 ]
+
+[project.urls]
+Repository = "https://github.com/ChronoRixun/xemu-mcp"
 
 [project.scripts]
 xemu-mcp = "xemu_mcp.__main__:main"

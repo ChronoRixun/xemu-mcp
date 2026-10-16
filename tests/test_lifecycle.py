@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,16 +70,42 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             allowed = Path(tmp) / 'test-builds'
             forbidden = Path(tmp) / 'play-build'
-            emulator = Emulator(Config(allowed_game_roots=[str(allowed)]))
+            emulator = Emulator(Config(allowed_game_roots=[str(allowed)],
+                                       protected_processes=['ExampleGame.exe']))
             for location, permitted in ((allowed, True), (forbidden, False),
                                         (Path(str(allowed) + '-lookalike'), False)):
-                game = Mock(pid=987, info={'name': 'XMen2.exe', 'exe': str(location / 'XMen2.exe')})
+                game = Mock(pid=987, info={'name': 'ExampleGame.exe',
+                                          'exe': str(location / 'ExampleGame.exe')})
                 with patch('xemu_mcp.service.psutil.process_iter', return_value=[game]):
                     if permitted:
                         emulator._check_games()
                     else:
                         with self.assertRaisesRegex(RuntimeError, 'Protected'):
                             emulator._check_games()
+
+    def test_protected_processes_default_empty_and_env_var_is_honored(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(Config().protected_processes, [])
+        env = {'XEMU_MCP_PROTECTED_PROCESSES': 'ExampleGame.exe; other.exe,, '}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(Config().protected_processes, ['ExampleGame.exe', 'other.exe'])
+        # A name supplied only via the environment blocks _check_games.
+        with patch.dict(os.environ, env, clear=True):
+            emulator = Emulator(Config())
+        game = Mock(pid=987, info={'name': 'other.exe', 'exe': 'invented/other.exe'})
+        with patch('xemu_mcp.service.psutil.process_iter', return_value=[game]):
+            with self.assertRaisesRegex(RuntimeError, 'Protected'):
+                emulator._check_games()
+        # An explicit config list wins over the environment variable.
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(Config(protected_processes=['Configured.exe']).protected_processes,
+                             ['Configured.exe'])
+        # Matching is case-insensitive against the running process name.
+        emulator = Emulator(Config(protected_processes=['ExampleGame.exe']))
+        game = Mock(pid=987, info={'name': 'EXAMPLEGAME.EXE', 'exe': 'invented/ExampleGame.exe'})
+        with patch('xemu_mcp.service.psutil.process_iter', return_value=[game]):
+            with self.assertRaisesRegex(RuntimeError, 'Protected'):
+                emulator._check_games()
 
 
 if __name__ == '__main__':

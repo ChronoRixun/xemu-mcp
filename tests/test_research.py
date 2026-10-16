@@ -363,15 +363,67 @@ class ResearchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('c', self.peer.log)
         self.assertFalse(self.peer.running)  # the requested final state applies to failures too
 
+    async def test_break_wait_cancellation_mid_arm_still_disarms(self):
+        # Hold back the Z0 acknowledgment so cancellation deterministically
+        # lands after the stub processed the insert but before break_wait can
+        # record it; the finally must still remove the point.
+        self.emulator.break_set('0x1234')
+        acked = asyncio.get_running_loop().create_future()
+        release = asyncio.get_running_loop().create_future()
+        real_send = self.peer.send
+        held = False
+
+        async def hold_first_ack(writer, text, ack=True):
+            nonlocal held
+            if not held and text == 'OK':
+                held = True
+                acked.set_result(None)
+                await release
+            return await real_send(writer, text, ack=ack)
+
+        self.peer.send = hold_first_ack
+        task = asyncio.create_task(self.emulator.break_wait(timeout_s=10))
+        try:
+            await asyncio.wait_for(acked, 5)
+            task.cancel()
+            release.set_result(None)
+            with anyio.move_on_after(5):
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertEqual(self.peer.inserted, set())
+            self.assertFalse(self.peer.running)
+        finally:
+            if not release.done():
+                release.set_result(None)
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     async def test_break_wait_cancellation_still_disarms_and_restores(self):
         self.emulator.break_set('0x1234')
         self.peer.ignore_interrupt = self.peer.ignore_qmp_stop = True
-        with anyio.move_on_after(.05) as scope:
-            await self.emulator.break_wait(timeout_s=10)
-        self.assertTrue(scope.cancel_called)
-        await asyncio.sleep(.05)
-        self.assertEqual(self.peer.inserted, set())
-        self.assertFalse(self.peer.running)
+        task = asyncio.create_task(self.emulator.break_wait(timeout_s=10))
+        try:
+            # Wait until the synthetic peer has processed the continue request
+            # (generously), so cancellation always lands inside the stop wait
+            # and never mid-arming; no fixed grace period is needed after it.
+            for _ in range(500):
+                if 'c' in self.peer.log:
+                    break
+                await asyncio.sleep(.01)
+            else:
+                self.fail('the synthetic peer never processed the continue request')
+            task.cancel()
+            with anyio.move_on_after(5):
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertTrue(task.cancelled())
+            self.assertEqual(self.peer.inserted, set())
+            self.assertFalse(self.peer.running)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def test_snapshot_catalogue_records_lists_and_checks_emulator(self):
         await self.emulator.snapshot('save', 'invented-bridge', description='Before invented boss',
