@@ -61,7 +61,9 @@ class Config:
                 or any(not isinstance(root, str) or not Path(root).is_absolute()
                        for root in self.allowed_game_roots)):
             raise ValueError('allowed_game_roots must be a list of absolute paths')
-        if not self.protected_processes:
+        # Only a missing key or an empty list falls back to the environment;
+        # an explicit falsy non-list (null, "") is invalid and must raise.
+        if isinstance(self.protected_processes, list) and not self.protected_processes:
             listed = os.environ.get('XEMU_MCP_PROTECTED_PROCESSES')
             if listed:
                 self.protected_processes = [name.strip() for name in re.split(r'[,;]', listed)
@@ -889,8 +891,11 @@ class Emulator:
                 # QEMU clears stale GDB points on '?'; also confirms the stub.
                 await gdb.request('?')
                 for point in points:
-                    await gdb.set_point(point['z'], int(point['address'], 16), point['length'])
+                    # Record before the insert exchange: a cancellation that
+                    # lands after the stub processed Z but before the request
+                    # returned must still find the point here and disarm it.
                     armed.append(point)
+                    await gdb.set_point(point['z'], int(point['address'], 16), point['length'])
                 reply, interrupted = await gdb.resume_until_stop(
                     timeout_s, interrupt=lambda: self.qmp.execute('stop'))
             finally:

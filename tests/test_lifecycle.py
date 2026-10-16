@@ -89,6 +89,13 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         env = {'XEMU_MCP_PROTECTED_PROCESSES': 'ExampleGame.exe; other.exe,, '}
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(Config().protected_processes, ['ExampleGame.exe', 'other.exe'])
+        # A name supplied only via the environment blocks _check_games.
+        with patch.dict(os.environ, env, clear=True):
+            emulator = Emulator(Config())
+        game = Mock(pid=987, info={'name': 'other.exe', 'exe': 'invented/other.exe'})
+        with patch('xemu_mcp.service.psutil.process_iter', return_value=[game]):
+            with self.assertRaisesRegex(RuntimeError, 'Protected'):
+                emulator._check_games()
         # An explicit config list wins over the environment variable.
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(Config(protected_processes=['Configured.exe']).protected_processes,

@@ -192,8 +192,8 @@ does not prove the game consumed the input.
 Screenshot capability is detected using QMP `query-commands`. The
 `xemu-screenshot` QMP command is added by the xemu fork at
 https://github.com/ChronoRixun/xemu; stock xemu does not provide it. If the
-running build provides `xemu-screenshot` with a `filename` argument, that
-command is used;
+running build provides the `xemu-screenshot` command, it is used and is passed
+a `filename` argument;
 errors from it propagate rather than silently falling back. Otherwise Windows
 captures the visible client region, including xemu overlays and scaling. This is
 **not guest-resolution capture**. The window must be restored and unobscured;
